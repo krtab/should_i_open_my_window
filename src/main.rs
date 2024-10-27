@@ -4,6 +4,10 @@ use comfy_table::{
     presets::{ASCII_FULL_CONDENSED, UTF8_FULL_CONDENSED},
     Cell, Cells, Table,
 };
+use open_meteo_rs::{
+    forecast::{ForecastResult, Options},
+    Client,
+};
 
 const TEMP_RANGE: [f64; 13] = [
     16., 16.5, 17., 17.5, 18., 18.5, 19., 19.5, 20., 20.5, 21., 21.5, 22.,
@@ -28,26 +32,65 @@ async fn main() {
     let mut opts = open_meteo_rs::forecast::Options::default();
 
     // Location
-    let args @ Args { lat, lng, .. } = Args::parse();
+    let Args { lat, lng, ascii } = Args::parse();
     opts.location = open_meteo_rs::Location { lat, lng };
     opts.elevation = Some(63.1.into());
     opts.temperature_unit = Some(open_meteo_rs::forecast::TemperatureUnit::Celsius);
     opts.time_zone = Some("auto".to_owned());
-
-    // Past days (0-2)
-    // opts.past_days = Some(2); // !! mutually exclusive with dates
-
-    // Forecast days (0-16)
-    opts.forecast_days = Some(2); // !! mutually exclusive with dates
-                                  // Hourly parameters
+    opts.forecast_days = Some(7);
     opts.hourly.push("temperature_2m".into());
     opts.hourly.push("relative_humidity_2m".into());
-    let res = client.forecast(opts).await.unwrap();
+    let forecast = client.forecast(opts).await.unwrap();
 
+    let t_h = print_one_table(&forecast, TableType::Hourly(10), ascii);
+    let t_d = print_one_table(&forecast, TableType::Daily(7), ascii);
+    println!("{}\n", DOC_STR);
+    println!("{t_h}\n");
+    println!("{t_d}");
+}
+
+enum TableType {
+    Hourly(u8),
+    Daily(u8),
+}
+
+impl TableType {
+    fn name(&self) -> &'static str {
+        match self {
+            TableType::Hourly(_) => "Hourly",
+            TableType::Daily(_) => "Daily",
+        }
+    }
+
+    fn truncate(&self) -> TimeDelta {
+        match self {
+            TableType::Hourly(_) => TimeDelta::hours(1),
+            TableType::Daily(_) => TimeDelta::days(1),
+        }
+    }
+
+    fn count(&self) -> usize {
+        match self {
+            &TableType::Hourly(n) => n as usize,
+            &TableType::Daily(n) => n as usize,
+        }
+    }
+
+    fn step(&self) -> usize {
+        match self {
+            TableType::Hourly(_) => 1,
+            TableType::Daily(_) => 24,
+        }
+    }
+}
+
+fn print_one_table(forecast: &ForecastResult, table_type: TableType, ascii: bool) -> Table {
     let mut table = Table::new();
     let sat_press: [f64; TEMP_RANGE.len()] =
         std::array::from_fn(|i| celsius_sat_pres(TEMP_RANGE[i]));
-    let mut header = vec![Cell::new(String::new())];
+    let mut header =
+        vec![Cell::new(String::from(table_type.name()))
+            .add_attribute(comfy_table::Attribute::Italic)];
     for temp in TEMP_RANGE {
         let cell = Cell::new(format!("{temp:.1}°C")).add_attribute(comfy_table::Attribute::Bold);
         header.push(cell);
@@ -55,18 +98,18 @@ async fn main() {
     table.set_header(Cells(header));
     let now = chrono::offset::Local::now()
         .naive_local()
-        .duration_trunc(TimeDelta::hours(1))
+        .duration_trunc(table_type.truncate())
         .unwrap();
-    for forecast in res
-        .hourly
+    for forecast_hrly in (&forecast.hourly)
         .into_iter()
         .flatten()
         .skip_while(|forecast| forecast.datetime < now)
-        .take(10)
+        .step_by(table_type.step())
+        .take(table_type.count())
     {
-        let mut row: Vec<Cell> = vec![forecast.datetime.into()];
-        let forecast_temp = forecast.values["temperature_2m"].value.as_f64().unwrap();
-        let forecast_rh = forecast.values["relative_humidity_2m"]
+        let mut row: Vec<Cell> = vec![forecast_hrly.datetime.into()];
+        let forecast_temp = forecast_hrly.values["temperature_2m"].value.as_f64().unwrap();
+        let forecast_rh = forecast_hrly.values["relative_humidity_2m"]
             .value
             .as_f64()
             .unwrap();
@@ -78,13 +121,12 @@ async fn main() {
         }
         table.add_row(Cells(row));
     }
-    if args.ascii {
+    if ascii {
         table.load_preset(ASCII_FULL_CONDENSED);
     } else {
         table.load_preset(UTF8_FULL_CONDENSED);
     }
-    println!("{}\n", DOC_STR);
-    println!("{table}");
+    table
 }
 
 fn rh_cell(rh: f64) -> Cell {
