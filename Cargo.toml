@@ -8,6 +8,7 @@ chrono = "0.4.38"
 chrono-tz = "0.10.0"
 clap = { version = "4.5.20", features = ["derive"] }
 comfy-table = "7.1.1"
+itertools = "0.13.0"
 open-meteo-rs = "0.0.4"
 rust-steam = "0.1.9"
 tokio = { version = "1.41.0", features = ["full"] }

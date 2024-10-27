@@ -1,13 +1,11 @@
-use chrono::{DurationRound, TimeDelta};
+use chrono::{DurationRound, NaiveDate, TimeDelta};
 use clap::Parser;
 use comfy_table::{
     presets::{ASCII_FULL_CONDENSED, UTF8_FULL_CONDENSED},
     Cell, Cells, Table,
 };
-use open_meteo_rs::{
-    forecast::{ForecastResult, Options},
-    Client,
-};
+use itertools::Itertools;
+use open_meteo_rs::forecast::ForecastResultHourly;
 
 const TEMP_RANGE: [f64; 13] = [
     16., 16.5, 17., 17.5, 18., 18.5, 19., 19.5, 20., 20.5, 21., 21.5, 22.,
@@ -42,49 +40,101 @@ async fn main() {
     opts.hourly.push("relative_humidity_2m".into());
     let forecast = client.forecast(opts).await.unwrap();
 
-    let t_h = print_one_table(&forecast, TableType::Hourly(10), ascii);
-    let t_d = print_one_table(&forecast, TableType::Daily(7), ascii);
+    let this_day_and_hour = chrono::offset::Local::now()
+        .naive_local()
+        .duration_trunc(TimeDelta::hours(1))
+        .unwrap();
+
+    let hourly_forecast = forecast
+        .hourly
+        .iter()
+        .flatten()
+        .skip_while(|forecast| forecast.datetime < this_day_and_hour)
+        .map(ForeCastItem::from_api)
+        .take(10);
+    let t_h = print_one_table(hourly_forecast, TableType::Hourly, ascii);
     println!("{}\n", DOC_STR);
     println!("{t_h}\n");
+
+    let daily_groups = forecast
+        .hourly
+        .iter()
+        .flatten()
+        .chunk_by(|item| item.datetime.date());
+    let daily_forcast_avg = daily_groups
+        .into_iter()
+        .map(|(date, group)| average_daily(date, group))
+        .take(7);
+    let t_d = print_one_table(daily_forcast_avg, TableType::Daily, ascii);
     println!("{t_d}");
 }
 
+fn extract_temp_rh(item: &ForecastResultHourly) -> (f64, f64) {
+    (
+        item.values["temperature_2m"].value.as_f64().unwrap(),
+        item.values["relative_humidity_2m"].value.as_f64().unwrap(),
+    )
+}
+
+fn average_daily<'a>(
+    date: NaiveDate,
+    forcast: impl Iterator<Item = &'a ForecastResultHourly>,
+) -> ForeCastItem {
+    let mut count = 0.;
+    let mut temperature = 0.;
+    let mut relative_humidity = 0.;
+    for item in forcast {
+        count += 1.;
+        let (temp, rh) = extract_temp_rh(item);
+        temperature += temp;
+        relative_humidity += rh;
+    }
+    temperature /= count;
+    relative_humidity /= count;
+    ForeCastItem {
+        datetime_repr: date.format("%A, %b %d").to_string(),
+        temperature,
+        relative_humidity,
+    }
+}
+
 enum TableType {
-    Hourly(u8),
-    Daily(u8),
+    Hourly,
+    Daily,
 }
 
 impl TableType {
     fn name(&self) -> &'static str {
         match self {
-            TableType::Hourly(_) => "Hourly",
-            TableType::Daily(_) => "Daily",
-        }
-    }
-
-    fn truncate(&self) -> TimeDelta {
-        match self {
-            TableType::Hourly(_) => TimeDelta::hours(1),
-            TableType::Daily(_) => TimeDelta::days(1),
-        }
-    }
-
-    fn count(&self) -> usize {
-        match self {
-            &TableType::Hourly(n) => n as usize,
-            &TableType::Daily(n) => n as usize,
-        }
-    }
-
-    fn step(&self) -> usize {
-        match self {
-            TableType::Hourly(_) => 1,
-            TableType::Daily(_) => 24,
+            TableType::Hourly => "Hourly",
+            TableType::Daily => "Daily",
         }
     }
 }
 
-fn print_one_table(forecast: &ForecastResult, table_type: TableType, ascii: bool) -> Table {
+struct ForeCastItem {
+    datetime_repr: String,
+    temperature: f64,
+    relative_humidity: f64,
+}
+
+impl ForeCastItem {
+    fn from_api(api_item: &ForecastResultHourly) -> Self {
+        let datetime_repr = format!("{}", api_item.datetime.format("%a %H:%M"));
+        let (temperature, relative_humidity) = extract_temp_rh(api_item);
+        Self {
+            datetime_repr,
+            temperature,
+            relative_humidity,
+        }
+    }
+}
+
+fn print_one_table(
+    forecast: impl Iterator<Item = ForeCastItem>,
+    table_type: TableType,
+    ascii: bool,
+) -> Table {
     let mut table = Table::new();
     let sat_press: [f64; TEMP_RANGE.len()] =
         std::array::from_fn(|i| celsius_sat_pres(TEMP_RANGE[i]));
@@ -96,25 +146,15 @@ fn print_one_table(forecast: &ForecastResult, table_type: TableType, ascii: bool
         header.push(cell);
     }
     table.set_header(Cells(header));
-    let now = chrono::offset::Local::now()
-        .naive_local()
-        .duration_trunc(table_type.truncate())
-        .unwrap();
-    for forecast_hrly in (&forecast.hourly)
-        .into_iter()
-        .flatten()
-        .skip_while(|forecast| forecast.datetime < now)
-        .step_by(table_type.step())
-        .take(table_type.count())
-    {
-        let mut row: Vec<Cell> = vec![forecast_hrly.datetime.into()];
-        let forecast_temp = forecast_hrly.values["temperature_2m"].value.as_f64().unwrap();
-        let forecast_rh = forecast_hrly.values["relative_humidity_2m"]
-            .value
-            .as_f64()
-            .unwrap();
-        let forecast_sat_pres = celsius_sat_pres(forecast_temp);
-        let forecast_vapor_pressure = forecast_rh * forecast_sat_pres;
+    for forecast_item in forecast {
+        let mut row: Vec<Cell> = vec![format!(
+            "{datetime} ({temp:.1}°C)",
+            datetime = forecast_item.datetime_repr,
+            temp = forecast_item.temperature
+        )
+        .into()];
+        let forecast_sat_pres = celsius_sat_pres(forecast_item.temperature);
+        let forecast_vapor_pressure = forecast_item.relative_humidity * forecast_sat_pres;
         for &sat_pres in &sat_press {
             let rh = forecast_vapor_pressure / sat_pres;
             row.push(rh_cell(rh));
